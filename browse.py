@@ -15,6 +15,8 @@ WECHAT_ROOT = (
     / "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium"
 )
 API_PAGE_MARKER = b"growSpace/page"
+ALBUM_IMG_URL_RE = re.compile(r"https://album-img\.xiaohebook\.com/[^\"\\]+")
+DEFAULT_WINDOW_TITLE = "亲小禾"
 
 
 def discover_cache_dirs() -> list[Path]:
@@ -27,7 +29,7 @@ def discover_cache_dirs() -> list[Path]:
 def scan_feed_cache() -> tuple[set[int], int | None, int]:
     pages: set[int] = set()
     total_posts: int | None = None
-    photo_urls = 0
+    unique_urls: set[str] = set()
 
     for cache_dir in discover_cache_dirs():
         for entry in cache_dir.iterdir():
@@ -37,7 +39,7 @@ def scan_feed_cache() -> tuple[set[int], int | None, int]:
                 data = entry.read_bytes()
             except OSError:
                 continue
-            if API_PAGE_MARKER not in data:
+            if API_PAGE_MARKER not in data and b"album-img.xiaohebook.com" not in data:
                 continue
 
             text = data.decode("utf-8", errors="ignore")
@@ -50,11 +52,10 @@ def scan_feed_cache() -> tuple[set[int], int | None, int]:
                 pages.add(int(page_match.group(1)))
                 total_posts = int(page_match.group(2))
 
-            photo_urls += len(
-                re.findall(r"https://album-img\.xiaohebook\.com/[^\"\\]+", text)
-            )
+            for match in ALBUM_IMG_URL_RE.finditer(text):
+                unique_urls.add(match.group(0).split("?")[0])
 
-    return pages, total_posts, photo_urls
+    return pages, total_posts, len(unique_urls)
 
 
 def expected_pages(total_posts: int | None, page_size: int) -> int | None:
@@ -73,25 +74,200 @@ def accessibility_trusted() -> bool:
     return result.returncode == 0
 
 
-def activate_wechat() -> None:
-    subprocess.run(["open", "-a", "WeChat"], check=False)
-    subprocess.run(
-        ["osascript", "-e", 'tell application "WeChat" to activate'],
-        check=False,
+def run_applescript(script: str) -> str:
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "AppleScript failed")
+    return result.stdout.strip()
+
+
+def find_window_center(title: str = DEFAULT_WINDOW_TITLE) -> tuple[float, float] | None:
+    safe_title = title.replace('"', '\\"')
+    script = f'''
+tell application "System Events"
+    tell process "WeChat"
+        set frontmost to true
+        repeat with w in windows
+            if name of w contains "{safe_title}" then
+                set p to position of w
+                set s to size of w
+                set cx to (item 1 of p) + (item 1 of s) / 2
+                set cy to (item 2 of p) + (item 2 of s) / 2
+                return (cx as text) & "|" & (cy as text)
+            end if
+        end repeat
+    end tell
+end tell
+'''
+    try:
+        output = run_applescript(script)
+    except RuntimeError:
+        return None
+    if not output or "|" not in output:
+        return None
+    x_str, y_str = output.split("|", 1)
+    return float(x_str), float(y_str)
+
+
+def focus_wechat_window(title: str = DEFAULT_WINDOW_TITLE) -> bool:
+    safe_title = title.replace('"', '\\"')
+    script = f'''
+tell application "WeChat" to activate
+delay 0.2
+tell application "System Events"
+    tell process "WeChat"
+        set frontmost to true
+        repeat with w in windows
+            if name of w contains "{safe_title}" then
+                perform action "AXRaise" of w
+                return "ok"
+            end if
+        end repeat
+    end tell
+end tell
+'''
+    try:
+        return run_applescript(script) == "ok"
+    except RuntimeError:
+        return False
+
+
+def move_mouse(x: float, y: float) -> None:
+    from Quartz import (
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        kCGEventMouseMoved,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
     )
 
+    event = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, event)
 
-def scroll_down(lines: int = 8) -> None:
-    import Quartz
+
+def click_at(x: float, y: float) -> None:
+    from Quartz import (
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+    )
+
+    down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x, y), kCGMouseButtonLeft)
+    up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, down)
+    time.sleep(0.03)
+    CGEventPost(kCGHIDEventTap, up)
+
+
+def scroll_pixels(amount: int) -> None:
     from Quartz import (
         CGEventCreateScrollWheelEvent,
         CGEventPost,
         kCGHIDEventTap,
-        kCGScrollEventUnitLine,
+        kCGScrollEventUnitPixel,
     )
 
-    event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 1, -lines)
+    # Negative values scroll content downward (see older posts).
+    event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 1, -amount)
     CGEventPost(kCGHIDEventTap, event)
+
+
+def press_page_down() -> None:
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventPost,
+        kCGHIDEventTap,
+    )
+
+    # macOS virtual key code for Page Down.
+    for event_type in (True, False):
+        event = CGEventCreateKeyboardEvent(None, 121, event_type)
+        CGEventPost(kCGHIDEventTap, event)
+
+
+def press_arrow_down(times: int = 5) -> None:
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventPost,
+        kCGHIDEventTap,
+    )
+
+    for _ in range(times):
+        for pressed in (True, False):
+            event = CGEventCreateKeyboardEvent(None, 125, pressed)
+            CGEventPost(kCGHIDEventTap, event)
+        time.sleep(0.02)
+
+
+def drag_scroll_up(x: float, y: float, distance: int = 260) -> None:
+    """Drag upward inside the feed to mimic touch scrolling."""
+    from Quartz import (
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        kCGEventLeftMouseDragged,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+    )
+
+    start = (x, y)
+    end = (x, y - distance)
+    down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, start, kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, down)
+    time.sleep(0.05)
+    steps = 8
+    for step in range(1, steps + 1):
+        ratio = step / steps
+        point = (
+            start[0] + (end[0] - start[0]) * ratio,
+            start[1] + (end[1] - start[1]) * ratio,
+        )
+        drag = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, point, kCGMouseButtonLeft)
+        CGEventPost(kCGHIDEventTap, drag)
+        time.sleep(0.02)
+    up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, end, kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, up)
+
+
+def prepare_scroll_target(title: str) -> tuple[float, float] | None:
+    if not focus_wechat_window(title):
+        print(f"未找到标题包含「{title}」的微信窗口，请确认亲小禾小程序已打开。", file=sys.stderr)
+        return None
+
+    center = find_window_center(title)
+    if center is None:
+        return None
+
+    x, y = center
+    # Aim slightly below center where the feed list usually sits.
+    list_y = y + 80
+    move_mouse(x, list_y)
+    time.sleep(0.1)
+    click_at(x, list_y)
+    time.sleep(0.15)
+    return x, list_y
+
+
+def perform_scroll_step(x: float, y: float, *, scroll_pixels_amount: int) -> None:
+    move_mouse(x, y)
+    time.sleep(0.05)
+    press_page_down()
+    time.sleep(0.1)
+    scroll_pixels(scroll_pixels_amount)
+    time.sleep(0.08)
+    scroll_pixels(scroll_pixels_amount)
+    time.sleep(0.08)
+    press_arrow_down(times=4)
+    time.sleep(0.08)
+    drag_scroll_up(x, y, distance=220)
 
 
 def countdown(seconds: int) -> None:
@@ -104,10 +280,13 @@ def countdown(seconds: int) -> None:
 def run_browse(
     *,
     scroll_count: int,
-    scroll_lines: int,
+    scroll_pixels_amount: int,
     pause: float,
     until_pages: int | None,
     prep_seconds: int,
+    stagnant_limit: int,
+    window_title: str,
+    use_ai: bool = False,
 ) -> int:
     if not accessibility_trusted():
         print(
@@ -127,24 +306,65 @@ def run_browse(
     print("  1. 打开 Mac 版微信")
     print("  2. 进入「亲小禾」小程序")
     print("  3. 打开「成长空间 / 班级动态」列表页")
-    print("  4. 把鼠标移到动态列表区域（滚轮会在这里生效）")
+    print("  4. 保持亲小禾窗口可见（脚本会自动点击列表区域）")
     print()
     if total_posts:
         print(f"当前缓存：已加载 {len(pages)} 页 API，共 {total_posts} 条动态，约 {photo_urls} 个图片 URL")
         if target_pages:
             print(f"目标：加载全部 {target_pages} 页 API 数据")
+    if use_ai:
+        print("AI 视觉模式：已开启（截图分析判断是否到底 / 滚动是否生效）")
     print()
     countdown(prep_seconds)
 
-    activate_wechat()
-    time.sleep(0.8)
+    scroll_point = prepare_scroll_target(window_title)
+    if scroll_point is None:
+        print("无法定位亲小禾窗口，请确认小程序已打开且窗口标题包含「亲小禾」。", file=sys.stderr)
+        return 1
+
+    x, y = scroll_point
+    print(f"已定位窗口，滚动焦点：({int(x)}, {int(y)})")
+    print()
 
     last_pages = len(pages)
+    last_urls = photo_urls
     stagnant_rounds = 0
+    ai_ineffective_rounds = 0
+    current_pixels = scroll_pixels_amount
 
     for i in range(1, scroll_count + 1):
-        scroll_down(scroll_lines)
+        prepare_scroll_target(window_title)
+        perform_scroll_step(x, y, scroll_pixels_amount=current_pixels)
         time.sleep(pause)
+
+        if use_ai:
+            try:
+                from vision import analyze_feed_screenshot, capture_window_screenshot
+
+                screenshot = capture_window_screenshot(window_title)
+                if screenshot is not None:
+                    result = analyze_feed_screenshot(screenshot)
+                    print(
+                        f"  AI: 到底={result.at_bottom} 有效={result.scroll_effective} "
+                        f"置信度={result.confidence:.2f} | {result.reason}",
+                        flush=True,
+                    )
+                    if result.at_bottom and result.confidence >= 0.6:
+                        print("\nAI 判断已滑到列表底部。")
+                        break
+                    if not result.scroll_effective:
+                        ai_ineffective_rounds += 1
+                        current_pixels = min(current_pixels + 120, 1200)
+                        if ai_ineffective_rounds >= 3:
+                            print("  AI: 滚动似乎无效，加大滚动幅度并重新点击列表区域")
+                            scroll_point = prepare_scroll_target(window_title)
+                            if scroll_point is not None:
+                                x, y = scroll_point
+                            ai_ineffective_rounds = 0
+                    else:
+                        ai_ineffective_rounds = 0
+            except Exception as exc:
+                print(f"  AI 分析跳过: {exc}", flush=True)
 
         pages, total_posts, photo_urls = scan_feed_cache()
         target_pages = until_pages or expected_pages(total_posts, page_size=10)
@@ -162,14 +382,22 @@ def run_browse(
             print(f"\n已加载全部 {target_pages} 页 API 数据，可以停止浏览。")
             break
 
-        if len(pages) == last_pages:
+        if len(pages) == last_pages and photo_urls == last_urls:
             stagnant_rounds += 1
-            if stagnant_rounds >= 8:
-                print("\n连续多轮没有新页面，可能已到底或需要手动向上再向下刷新。")
+            if stagnant_rounds >= stagnant_limit:
+                if target_pages and len(pages) < target_pages:
+                    print(
+                        f"\n连续 {stagnant_limit} 轮没有新数据，但只加载了 {len(pages)}/{target_pages} 页。"
+                        "\n可能滚动仍未生效，请确认亲小禾动态列表在屏幕上可见，然后重试："
+                        "\n  python3 browse.py --scrolls 200 --stagnant-limit 40"
+                    )
+                else:
+                    print("\n已连续多轮没有新数据，可能已滑到列表底部。")
                 break
         else:
             stagnant_rounds = 0
             last_pages = len(pages)
+            last_urls = photo_urls
 
     pages, total_posts, photo_urls = scan_feed_cache()
     target_pages = until_pages or expected_pages(total_posts, page_size=10)
@@ -192,20 +420,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scrolls",
         type=int,
-        default=120,
-        help="最大滚动次数（默认 120）",
+        default=200,
+        help="最大滚动次数（默认 200）",
     )
     parser.add_argument(
-        "--lines",
+        "--pixels",
         type=int,
-        default=10,
-        help="每次滚动的行数（默认 10）",
+        default=500,
+        help="每次滚动的像素量（默认 500）",
     )
     parser.add_argument(
         "--pause",
         type=float,
-        default=1.2,
-        help="每次滚动后的等待秒数（默认 1.2）",
+        default=1.5,
+        help="每次滚动后的等待秒数（默认 1.5）",
     )
     parser.add_argument(
         "--until-pages",
@@ -216,13 +444,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prep",
         type=int,
-        default=8,
-        help="开始滚动前的准备时间秒数（默认 8）",
+        default=5,
+        help="开始滚动前的准备时间秒数（默认 5）",
+    )
+    parser.add_argument(
+        "--stagnant-limit",
+        type=int,
+        default=30,
+        help="连续多少轮无新数据后停止（默认 30）",
+    )
+    parser.add_argument(
+        "--window-title",
+        type=str,
+        default=DEFAULT_WINDOW_TITLE,
+        help="微信窗口标题关键字（默认：亲小禾）",
     )
     parser.add_argument(
         "--status",
         action="store_true",
         help="只查看当前缓存进度，不滚动",
+    )
+    parser.add_argument(
+        "--ai",
+        action="store_true",
+        help="启用 AI 视觉模式（需 OPENAI_API_KEY，用截图判断是否到底）",
     )
     return parser
 
@@ -242,10 +487,13 @@ def main() -> int:
 
     return run_browse(
         scroll_count=args.scrolls,
-        scroll_lines=args.lines,
+        scroll_pixels_amount=args.pixels,
         pause=args.pause,
         until_pages=args.until_pages,
         prep_seconds=args.prep,
+        stagnant_limit=args.stagnant_limit,
+        window_title=args.window_title,
+        use_ai=args.ai,
     )
 
 
