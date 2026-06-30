@@ -85,6 +85,32 @@ python3 scripts/qinxiaohe-photo-sync/sync.py --watch
 python3 scripts/qinxiaohe-photo-sync/sync.py --cache-only
 ```
 
+### 群聊消息与老师「本周分享」
+
+班级群聊走腾讯 IM，需要**先打开群聊并向上滚动**，再导出。
+
+```bash
+# 1. 手动进入：亲小禾 → 消息 → 班级群聊
+# 2. 自动向上滚动，加载更早的聊天记录与老师分享卡片
+python3 scripts/qinxiaohe-photo-sync/browse_chat.py
+
+# 3. 导出群聊消息（JSON + Markdown），并下载分享里的图片
+python3 scripts/qinxiaohe-photo-sync/sync.py --chat-only
+
+# 只要老师发的分享
+python3 scripts/qinxiaohe-photo-sync/sync.py --chat-only --teacher-only --keyword 分享
+```
+
+输出目录：`~/Pictures/亲小禾/messages/`（`messages.json`、`messages.md`，图片在 `messages/shares/`）。
+
+```bash
+# 查看当前缓存里有多少条消息
+python3 scripts/qinxiaohe-photo-sync/browse_chat.py --status
+
+# 照片和群聊一起同步
+python3 scripts/qinxiaohe-photo-sync/sync.py --chat
+```
+
 ## 原理
 
 | 项目 | 说明 |
@@ -94,10 +120,13 @@ python3 scripts/qinxiaohe-photo-sync/sync.py --cache-only
 | 原图地址 | `album-img.xiaohebook.com/tmp_*.jpg`（公开可下载） |
 | 相册原图 | `album-img.xiaohebook.com` |
 | 动态视频 | `album-video.xiaohebook.com`（保存到 `videos/` 子目录） |
-| 去重 | 照片按内容 SHA256；视频按 URL + 文件哈希记录 |
+| 群聊 IM | 腾讯 IM SDK（本地 IndexedDB + 点开分享卡片后的 `albumContent/detail` 缓存） |
+| 去重 | 照片按内容 SHA256；视频按 URL + 文件哈希记录；消息按 message_id |
+| 文件名 | 从 API 缓存读取 `publishTime`，保存为 `YYYYMMDD_HHMMSS_原文件名.jpg` |
 
 ## 说明与限制
 
 - **browse.py** 负责加载 API 分页；加载越多，能同步的照片越多
+- **browse_chat.py** 负责在班级群聊里向上滚动，加载 TIM 历史与老师分享卡片缓存
 - 亲小禾 API 需要微信登录态，脚本**不能**直接调 API，只能从微信已浏览产生的缓存里读
 - 相册原图 URL 本身可公开下载，因此 sync 能拿到高清版（如 3072×4096），比缓存缩略图更清晰

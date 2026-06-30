@@ -42,6 +42,9 @@ IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
 
 URL_RE = re.compile(rb"https?://[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]+")
 API_PAGE_MARKER = b"growSpace/page"
+ALBUM_CONTENT_MARKER = b"albumContent/detail"
+GROW_FILE_MARKER = b"growFile/parentPick"
+API_SUCCESS_RE = re.compile(r'\{"success":true,"code":10000,"message":"成功","data":')
 ALBUM_IMG_URL_RE = re.compile(r"https://album-img\.xiaohebook\.com/[^\"\\]+")
 SIGN_IMG_URL_RE = re.compile(r"https://sign-img\.xiaohebook\.com/[^\"\\]+")
 ALBUM_VIDEO_URL_RE = re.compile(r"https://album-video\.xiaohebook\.com/tmp_[^\"\\?\|]+\.mp4")
@@ -181,13 +184,52 @@ def ext_from_url(url: str, default: str = "jpg") -> str:
     return suffix or default
 
 
-def filename_from_url(url: str, ext: str) -> str:
+def load_json_object(chunk: str) -> dict | None:
+    depth = 0
+    end: int | None = None
+    for index, char in enumerate(chunk):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end is None or end < 20:
+        return None
+    try:
+        obj = json.loads(chunk[:end])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def publish_time_file_prefix(publish_time: str | None) -> str | None:
+    if not publish_time:
+        return None
+    match = re.match(
+        r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?",
+        publish_time.strip(),
+    )
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    hour = hour or "00"
+    minute = minute or "00"
+    second = second or "00"
+    return f"{year}{month}{day}_{hour}{minute}{second}"
+
+
+def filename_from_url(url: str, ext: str, publish_time: str | None = None) -> str:
     parsed = urlparse(url)
     name = Path(unquote(parsed.path)).name or "photo"
     name = name.split("?")[0]
     if not name.lower().endswith(f".{ext}"):
         name = f"{name}.{ext}"
     name = re.sub(r"[^\w.\-]+", "_", name)
+    prefix = publish_time_file_prefix(publish_time)
+    if prefix:
+        name = f"{prefix}_{name}"
     return name[:180] or f"photo.{ext}"
 
 
@@ -330,6 +372,71 @@ def extract_photo_urls_from_api_cache(path: Path) -> Iterator[str]:
                 continue
             seen.add(url)
             yield url
+
+
+def _assign_publish_time_for_post(
+    publish_times: dict[str, str],
+    post: dict,
+    publish_time: str,
+) -> None:
+    content_list = post.get("contentList")
+    if isinstance(content_list, list):
+        for item in content_list:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, str) or not content.startswith("http"):
+                continue
+            content_type = str(item.get("contentType") or "")
+            if content_type in {"img", "image"}:
+                url = normalize_photo_url(content)
+                if is_photo_url(url):
+                    publish_times.setdefault(url, publish_time)
+            elif content_type == "video" or content.endswith(".mp4"):
+                url = normalize_video_url(content)
+                if is_video_url(url):
+                    publish_times.setdefault(url, publish_time)
+
+
+def extract_media_publish_times_from_api_cache(path: Path) -> dict[str, str]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    markers = (API_PAGE_MARKER, ALBUM_CONTENT_MARKER, GROW_FILE_MARKER, b'"contentList"')
+    if not any(marker in data for marker in markers):
+        return {}
+
+    text = data.decode("utf-8", errors="ignore")
+    publish_times: dict[str, str] = {}
+    for match in API_SUCCESS_RE.finditer(text):
+        obj = load_json_object(text[match.start() : match.start() + 200_000])
+        if obj is None:
+            continue
+        payload = obj.get("data")
+        posts: list[dict] = []
+        if isinstance(payload, dict):
+            items = payload.get("list")
+            if isinstance(items, list):
+                posts.extend(item for item in items if isinstance(item, dict))
+            else:
+                posts.append(payload)
+        for post in posts:
+            publish_time = post.get("publishTime") or post.get("recordTime")
+            if isinstance(publish_time, str) and publish_time.strip():
+                _assign_publish_time_for_post(publish_times, post, publish_time.strip())
+    return publish_times
+
+
+def collect_media_publish_times(cache_dirs: list[Path]) -> dict[str, str]:
+    publish_times: dict[str, str] = {}
+    for cache_dir in cache_dirs:
+        for entry in cache_dir.iterdir():
+            if not entry.is_file() or entry.name in {"index", "the-real-index"}:
+                continue
+            for url, publish_time in extract_media_publish_times_from_api_cache(entry).items():
+                publish_times.setdefault(url, publish_time)
+    return publish_times
 
 
 def extract_video_urls_from_api_cache(path: Path) -> Iterator[str]:
@@ -484,6 +591,7 @@ def sync_videos(
     if not video_urls:
         return 0, 0, 0
 
+    publish_times = collect_media_publish_times(cache_dirs)
     total = len(video_urls)
     log(f"发现 {total} 个视频，开始同步…")
 
@@ -494,7 +602,8 @@ def sync_videos(
     copied = 0
     skipped = 0
     for index, url in enumerate(sorted(video_urls), start=1):
-        filename = filename_from_url(url, "mp4")
+        publish_time = publish_times.get(url)
+        filename = filename_from_url(url, "mp4", publish_time)
         if dry_run:
             log(f"[{index}/{total}] [dry-run] {VIDEO_DIR_NAME}/{filename}")
             copied += 1
@@ -537,6 +646,7 @@ def sync_videos(
             "filename": target.name,
             "sha256": digest,
             "source": video_urls[url],
+            "publish_time": publish_time,
             "synced_at": datetime.now(timezone.utc).isoformat(),
             "bytes": target.stat().st_size,
         }
@@ -557,6 +667,9 @@ def sync_all(
     *,
     dry_run: bool = False,
     download_urls: bool = True,
+    sync_chat: bool = False,
+    teacher_only: bool = False,
+    chat_keyword: str | None = None,
 ) -> None:
     cache_dirs, applet_dirs = discover_sources()
     if not cache_dirs and not applet_dirs:
@@ -587,7 +700,21 @@ def sync_all(
         f"视频新增 {video_copied} 个，跳过 {video_skipped} 个，识别 {video_total} 个"
     )
     log(f"保存目录: {output_dir}（视频在 {output_dir / VIDEO_DIR_NAME}）")
-    if photo_copied == 0 and photo_total == 0 and video_copied == 0 and video_total == 0:
+
+    if sync_chat:
+        from chat_sync import sync_chat_messages
+
+        log("")
+        log("开始同步群聊消息与老师分享…")
+        sync_chat_messages(
+            output_dir,
+            output_dir / "messages" / ".chat-state.json",
+            dry_run=dry_run,
+            teacher_only=teacher_only,
+            keyword=chat_keyword,
+        )
+
+    if photo_copied == 0 and photo_total == 0 and video_copied == 0 and video_total == 0 and not sync_chat:
         log(
             "\n提示：先运行 browse.py 自动滚动加载动态，或手动浏览亲小禾成长空间后再同步："
             "\n  python3 scripts/qinxiaohe-photo-sync/browse.py"
@@ -613,6 +740,7 @@ def sync_photos(
     already_synced_urls = synced_photo_urls(photos_state)
 
     photo_urls = collect_url_candidates(cache_dirs) if download_urls else {}
+    publish_times = collect_media_publish_times(cache_dirs) if download_urls else {}
     embedded = collect_embedded_candidates(cache_dirs, applet_dirs)
     total_tasks = len(photo_urls) + len(embedded)
 
@@ -630,7 +758,8 @@ def sync_photos(
     if download_urls:
         for url, source in sorted(photo_urls.items()):
             task_index += 1
-            filename = filename_from_url(url, ext_from_url(url))
+            publish_time = publish_times.get(url)
+            filename = filename_from_url(url, ext_from_url(url), publish_time)
 
             if url in already_synced_urls:
                 log(f"[{task_index}/{total_tasks}] 跳过已同步照片: {filename}")
@@ -656,12 +785,17 @@ def sync_photos(
                 skipped += 1
                 continue
 
-            target = unique_output_path(output_dir, filename_from_url(url, ext), digest)
+            target = unique_output_path(
+                output_dir,
+                filename_from_url(url, ext, publish_time),
+                digest,
+            )
             target.write_bytes(data)
             photos_state[digest] = {
                 "url": url,
                 "filename": target.name,
                 "source": source,
+                "publish_time": publish_time,
                 "synced_at": datetime.now(timezone.utc).isoformat(),
                 "bytes": len(data),
             }
@@ -787,6 +921,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="列出检测到的微信缓存路径",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="同时导出群聊消息与老师分享卡片到 messages/ 目录",
+    )
+    parser.add_argument(
+        "--chat-only",
+        action="store_true",
+        help="只同步群聊消息，不下载照片和视频",
+    )
+    parser.add_argument(
+        "--teacher-only",
+        action="store_true",
+        help="配合 --chat：只保留老师/保健医消息",
+    )
+    parser.add_argument(
+        "--keyword",
+        type=str,
+        default=None,
+        help="配合 --chat：只保留包含关键字的分享（例如：本周分享）",
+    )
     return parser
 
 
@@ -816,11 +971,26 @@ def main() -> int:
             print("\n已停止监听。")
         return 0
 
+    if args.chat_only:
+        from chat_sync import sync_chat_messages
+
+        sync_chat_messages(
+            output_dir,
+            output_dir / "messages" / ".chat-state.json",
+            dry_run=args.dry_run,
+            teacher_only=args.teacher_only,
+            keyword=args.keyword,
+        )
+        return 0
+
     sync_all(
         output_dir,
         state_path,
         dry_run=args.dry_run,
         download_urls=not args.cache_only,
+        sync_chat=args.chat,
+        teacher_only=args.teacher_only,
+        chat_keyword=args.keyword,
     )
     return 0
 
